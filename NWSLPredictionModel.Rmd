@@ -1,0 +1,400 @@
+---
+title: "Prediction Model"
+author: "Gabriel Diniz"
+date: "2026-06-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r libraries}
+
+library(tidyverse)
+library(ggrepel)
+library(knitr)
+
+```
+
+
+```{r intro}
+# =================================================================
+# NWSL Pythagorean Points Prediction Model — Full Version
+# =================================================================
+# Incorporates:
+#   - Pythagorean exponent fitted from historical NWSL season totals
+#   - Home/Away split goal rates from 2026 match data
+#   - Strength of Schedule (SRS-style) iterative adjustment
+#   - Match-by-match remaining schedule projection (inferred from
+#     round-robin structure: every team plays every other team once
+#     at home and once away)
+#
+# DATA FLOW:
+#   - historical_files : CSVs with Team/Matches/Points/GF/GA/Season
+#                        → used only to fit x
+#   - NWSL2026 Matches.csv : match-level 2026 data
+#                        → home/away rates, SoS, remaining schedule
+#
+# =================================================================
+```
+
+
+```{r config}
+# ================================================================
+# 0. Config
+# ================================================================
+matches_file     <- "NWSL2026 Matches.csv"
+total_games      <- 30      # full 2026 season length per team
+fallback_x       <- 1.7     # Hamilton (2011) literature fallback
+sos_iterations   <- 50      # SRS convergence iterations
+sos_weight       <- 0.25    # fraction of SoS rating applied to goal adjustment (0 = none, 1 = full)
+
+historical_files <- c(
+  "NWSL2024Table.csv",
+  "NWSL2025Table.csv"
+)
+```
+
+
+```{r load data}
+# ================================================================
+# 1. Load data
+# ================================================================
+
+# --- 2026 match data ---
+matches <- read_csv(matches_file, show_col_types = FALSE)
+
+required_cols <- c("Date", "Home Team", "Away Team", "Home Goals", "Away Goals")
+missing_cols  <- setdiff(required_cols, names(matches))
+if (length(missing_cols) > 0) {
+  stop("Missing column(s) in ", matches_file, ": ", paste(missing_cols, collapse = ", "))
+}
+
+# --- Historical season totals (for exponent fitting only) ---
+hist_data <- map(historical_files, \(f) {
+  df <- read_csv(f, show_col_types = FALSE)
+  missing_hist <- setdiff(c("Team","Matches","Points","GF","GA","Season"), names(df))
+  if (length(missing_hist) > 0) {
+    stop("Missing column(s) in ", f, ": ", paste(missing_hist, collapse = ", "))
+  }
+  df
+}) %>%
+  bind_rows() %>%
+  mutate(PointsPct = Points / (3 * Matches))
+
+cat(sprintf("Historical data: %d team-seasons across season(s): %s\n",
+            nrow(hist_data),
+            paste(sort(unique(hist_data$Season)), collapse = ", ")))
+```
+
+
+
+```{r exponent fit}
+# ================================================================
+# 2. Fit Pythagorean exponent from historical data
+# ================================================================
+sse <- function(x) {
+  pred <- hist_data$GF^x / (hist_data$GF^x + hist_data$GA^x)
+  sum((hist_data$PointsPct - pred)^2)
+}
+fit    <- optimize(sse, interval = c(0.1, 5))
+x_pyth <- fit$minimum
+cat(sprintf("Fitted Pythagorean exponent (x): %.3f  (literature fallback: %.2f)\n",
+            x_pyth, fallback_x))
+if (x_pyth <= 0.15 || x_pyth >= 4.85) {
+  warning("Fitted exponent landed at search boundary — consider using fallback_x instead.")
+}
+```
+
+
+```{r home and away}
+# ================================================================
+# 3. Home / Away split rates
+# ================================================================
+home_stats <- matches %>%
+  group_by(Team = `Home Team`) %>%
+  summarise(
+    Home_GP = n(),
+    Home_GF = sum(`Home Goals`),
+    Home_GA = sum(`Away Goals`),
+    .groups = "drop"
+  )
+
+away_stats <- matches %>%
+  group_by(Team = `Away Team`) %>%
+  summarise(
+    Away_GP = n(),
+    Away_GF = sum(`Away Goals`),
+    Away_GA = sum(`Home Goals`),
+    .groups = "drop"
+  )
+
+# Overall team totals (used for SoS and Pythagorean)
+team_stats <- full_join(home_stats, away_stats, by = "Team") %>%
+  mutate(
+    Matches = Home_GP + Away_GP,
+    GF      = Home_GF + Away_GF,
+    GA      = Home_GA + Away_GA,
+    Points  = 0L   # filled below from match results
+  )
+
+# Calculate points from match results
+points_tbl <- bind_rows(
+  matches %>% transmute(Team = `Home Team`,
+                        Pts  = case_when(`Home Goals` > `Away Goals` ~ 3L,
+                                         `Home Goals` == `Away Goals` ~ 1L,
+                                         TRUE ~ 0L)),
+  matches %>% transmute(Team = `Away Team`,
+                        Pts  = case_when(`Away Goals` > `Home Goals` ~ 3L,
+                                         `Away Goals` == `Home Goals` ~ 1L,
+                                         TRUE ~ 0L))
+) %>%
+  group_by(Team) %>%
+  summarise(Points = sum(Pts), .groups = "drop")
+
+team_stats <- team_stats %>%
+  select(-Points) %>%
+  left_join(points_tbl, by = "Team") %>%
+  mutate(PointsPct = Points / (3 * Matches))
+
+# Per-game rates split by venue
+team_stats <- team_stats %>%
+  mutate(
+    Home_GF_pg = Home_GF / Home_GP,
+    Home_GA_pg = Home_GA / Home_GP,
+    Away_GF_pg = Away_GF / Away_GP,
+    Away_GA_pg = Away_GA / Away_GP,
+    GF_pg      = GF / Matches,
+    GA_pg      = GA / Matches
+  )
+```
+
+
+```{r Strength of Schedule}
+# ================================================================
+# 4. Strength of Schedule (SRS-style iterative adjustment)
+# ================================================================
+# Each team's SoS rating = average of opponents' ratings.
+# We solve iteratively: rating[t] = goal_diff_pg[t] + avg(rating[opp])
+# Ratings are mean-centred each iteration to keep them stable.
+
+# Build opponent goal-differential lookup per match
+match_ratings <- matches %>%
+  transmute(
+    Home = `Home Team`,
+    Away = `Away Team`,
+    GD   = `Home Goals` - `Away Goals`
+  )
+
+teams     <- sort(unique(team_stats$Team))
+n_teams   <- length(teams)
+raw_gd    <- team_stats %>%
+  mutate(GD_pg = (GF - GA) / Matches) %>%
+  select(Team, GD_pg)
+
+ratings <- setNames(raw_gd$GD_pg, raw_gd$Team)
+
+for (i in seq_len(sos_iterations)) {
+  sos <- sapply(teams, function(t) {
+    opp_home <- match_ratings$Away[match_ratings$Home == t]
+    opp_away <- match_ratings$Home[match_ratings$Away == t]
+    all_opp  <- c(opp_home, opp_away)
+    if (length(all_opp) == 0) return(0)
+    mean(ratings[all_opp])
+  })
+  # Rebase from raw GD each iteration — don't accumulate on previous ratings
+  new_ratings <- setNames(raw_gd$GD_pg, raw_gd$Team) + sos
+  new_ratings <- new_ratings - mean(new_ratings)   # centre at zero
+  ratings     <- new_ratings
+}
+
+sos_df <- tibble(Team = names(ratings), SoS_Rating = round(ratings, 4))
+
+team_stats <- team_stats %>%
+  left_join(sos_df, by = "Team")
+```
+
+
+```{r Expected Points}
+# ================================================================
+# 5. SoS-adjusted Pythagorean expected points
+# ================================================================
+# Two separate SoS effects:
+#   1. Goal quality: goals against strong opponents count more
+#      (boosts Adj_GF and reduces Adj_GA for hard-schedule teams)
+#   2. Points expectation: more points expected against weak opponents,
+#      fewer against strong ones (direct shift to ExpPoints)
+# Both use sos_weight as the scaling factor.
+
+team_stats <- team_stats %>%
+  mutate(
+    # Effect 1: adjust goal rates for schedule difficulty
+    Adj_GF       = pmax(GF_pg + SoS_Rating * sos_weight, 0.01) * Matches,
+    Adj_GA       = pmax(GA_pg - SoS_Rating * sos_weight, 0.01) * Matches,
+    ExpPointsPct = Adj_GF^x_pyth / (Adj_GF^x_pyth + Adj_GA^x_pyth),
+    ExpPoints    = round(ExpPointsPct * 3 * Matches, 1),
+    # Effect 2: shift expected points up/down based on schedule difficulty
+    # Hard schedule (positive SoS) → fewer points expected → subtract
+    # Easy schedule (negative SoS) → more points expected → add
+    SoS_PtsAdj   = round(-SoS_Rating * sos_weight * Matches, 1),
+    AdjExpPoints = round(ExpPoints + SoS_PtsAdj, 1),
+    PointsDiff   = round(Points - AdjExpPoints, 1)
+  ) %>%
+  arrange(desc(PointsDiff))
+
+r2 <- cor(team_stats$Points, team_stats$AdjExpPoints)^2
+cat(sprintf("R-squared (actual vs. SoS-adjusted expected points): %.3f\n\n", r2))
+
+print(team_stats %>%
+        select(Team, Matches, GF, GA, SoS_Rating, Points, AdjExpPoints, PointsDiff),
+      n = Inf)
+
+kable(team_stats %>%
+        select(Team, Matches, GF, GA, SoS_Rating, Points, AdjExpPoints, PointsDiff))
+```
+
+
+```{r remaining schedule}
+# ================================================================
+# 6. Reconstruct remaining schedule
+# ================================================================
+# Full round-robin: every ordered (Home, Away) pair plays exactly once.
+all_fixtures <- expand_grid(
+  `Home Team` = teams,
+  `Away Team` = teams
+) %>%
+  filter(`Home Team` != `Away Team`)
+
+# Played matches (normalise to match key)
+played_keys <- matches %>%
+  mutate(key = paste(`Home Team`, `Away Team`, sep = " vs ")) %>%
+  pull(key)
+
+remaining <- all_fixtures %>%
+  mutate(key = paste(`Home Team`, `Away Team`, sep = " vs ")) %>%
+  filter(!key %in% played_keys) %>%
+  select(-key)
+
+cat(sprintf("\nRemaining fixtures: %d\n", nrow(remaining)))
+```
+
+
+```{r match projection}
+# ================================================================
+# 7. Match-by-match projection
+# ================================================================
+# For each remaining fixture, projects expected goals using each team's
+# home/away split rates, adjusted for opponent quality via SoS:
+#
+#   Effect 1 (goal quality): consistent with Section 5 —
+#     high SoS team scores more and concedes less after adjustment
+#
+#   Effect 2 (points expectation): facing a strong opponent reduces
+#     expected points per match, and vice versa — consistent with
+#     the SoS_PtsAdj shift applied in Section 5
+
+rate_lookup <- team_stats %>%
+  select(Team, Home_GF_pg, Home_GA_pg, Away_GF_pg, Away_GA_pg, SoS_Rating)
+
+proj_matches <- remaining %>%
+  left_join(rate_lookup %>%
+              rename(H_GF  = Home_GF_pg, H_GA  = Home_GA_pg,
+                     H_AGF = Away_GF_pg, H_AGA = Away_GA_pg,
+                     H_SoS = SoS_Rating),
+            by = c("Home Team" = "Team")) %>%
+  left_join(rate_lookup %>%
+              rename(A_GF  = Away_GF_pg, A_GA  = Away_GA_pg,
+                     A_HGF = Home_GF_pg, A_HGA = Home_GA_pg,
+                     A_SoS = SoS_Rating),
+            by = c("Away Team" = "Team")) %>%
+  mutate(
+    # --- Effect 1 continues unchanged from here ---
+    # --- Effect 1: SoS-adjusted expected goals ---
+    # Each team's attack/defense rate adjusted by their own SoS rating,
+    # then blended with the opponent's corresponding adjusted rate
+    H_att_adj  = pmax(H_GF + H_SoS * sos_weight, 0.01),  # home attack adjusted for quality
+    A_def_adj  = pmax(A_GA - A_SoS * sos_weight, 0.01),  # away defense adjusted for quality
+    A_att_adj  = pmax(A_GF + A_SoS * sos_weight, 0.01),  # away attack adjusted for quality
+    H_def_adj  = pmax(H_GA - H_SoS * sos_weight, 0.01),  # home defense adjusted for quality
+
+    Exp_Home_G = pmax((H_att_adj + A_def_adj) / 2, 0.01),
+    Exp_Away_G = pmax((A_att_adj + H_def_adj) / 2, 0.01),
+
+    # Pythagorean win probabilities
+    Home_WinPct = Exp_Home_G^x_pyth / (Exp_Home_G^x_pyth + Exp_Away_G^x_pyth),
+    Away_WinPct = 1 - Home_WinPct,
+
+    # Draw probability based on closeness of expected goals
+    Goal_Ratio  = pmin(Exp_Home_G, Exp_Away_G) / pmax(Exp_Home_G, Exp_Away_G),
+    Draw_Prob   = Goal_Ratio * 0.3,
+
+    # Base expected points from goal rates
+    Home_ExpPts = (Home_WinPct - Draw_Prob / 2) * 3 + Draw_Prob,
+    Away_ExpPts = (Away_WinPct - Draw_Prob / 2) * 3 + Draw_Prob,
+
+    # --- Effect 2: points expectation adjustment for opponent quality ---
+    # Strong opponent (high SoS) → fewer expected points, and vice versa
+    # Mirrors the SoS_PtsAdj logic in Section 5, applied per match
+    Home_AdjExpPts = pmin(pmax(Home_ExpPts - A_SoS * sos_weight, 0), 3),
+    Away_AdjExpPts = pmin(pmax(Away_ExpPts - H_SoS * sos_weight, 0), 3)
+  )
+
+# Accumulate projected remaining points per team
+home_proj <- proj_matches %>%
+  group_by(Team = `Home Team`) %>%
+  summarise(ProjRemainingPts = sum(Home_AdjExpPts), .groups = "drop")
+
+away_proj <- proj_matches %>%
+  group_by(Team = `Away Team`) %>%
+  summarise(ProjRemainingPts = sum(Away_AdjExpPts), .groups = "drop")
+
+proj_totals <- full_join(home_proj, away_proj, by = "Team") %>%
+  mutate(
+    ProjRemainingPts = round(
+      replace_na(ProjRemainingPts.x, 0) + replace_na(ProjRemainingPts.y, 0), 1)
+  ) %>%
+  select(Team, ProjRemainingPts)
+
+# Final projected standings
+proj_standings <- team_stats %>%
+  select(Team, Matches, Points) %>%
+  left_join(proj_totals, by = "Team") %>%
+  mutate(
+    GamesRemaining  = total_games - Matches,
+    ProjTotalPoints = round(Points + ProjRemainingPts, 1)
+  ) %>%
+  arrange(desc(ProjTotalPoints)) %>%
+  select(Team, Matches, GamesRemaining, Points, ProjRemainingPts, ProjTotalPoints)
+
+cat("\n--- Projected final standings ---\n")
+print(proj_standings, n = Inf)
+```
+
+
+```{r Plot}
+# ================================================================
+# 8. Plot: actual vs. SoS-adjusted expected points
+# ================================================================
+library(ggrepel)
+
+plt <- ggplot(team_stats, aes(x = ExpPoints, y = Points, label = Team)) +
+  geom_point(color = "steelblue", size = 2.5) +
+  geom_point(data = filter(team_stats, Team == "Angel City FC"),
+             color = "pink", size = 2.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  geom_text_repel(size = 3, color = "gray30", max.overlaps = Inf) +
+  labs(
+    title    = "NWSL: Actual vs. SoS-Adjusted Expected Points",
+    x        = "Expected Points (Pythagorean, SoS-adjusted)",
+    y        = "Actual Points"
+  ) +
+  theme_minimal(base_size = 13)
+
+print(plt)
+ggsave("actual_vs_expected_points.png", plt, width = 7, height = 7, dpi = 120)
+
+
+```
+

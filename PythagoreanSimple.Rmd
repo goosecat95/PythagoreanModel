@@ -1,0 +1,93 @@
+---
+title: "Simple Pythagorean Model"
+author: "Gabriel Diniz"
+date: "2026-06-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Users/goosecatenterprises/Desktop/Goosecat/Pythagorean Model/Prediction Model")
+```
+
+
+```{r}
+
+library(tidyverse)
+library(ggrepel)
+library(knitr)
+
+```
+
+
+```{r}
+
+x_pyth      <- 1.24   #Clive Beggs coefficients
+total_games <- 30    # full season length, used by the projection step below — adjust as needed
+
+team_stats <- read.csv("NWSLBreakTable.csv")
+
+team_stats <- team_stats %>%
+  mutate(
+    ExpPointsPct = GF^x_pyth / (GF^x_pyth + GA^x_pyth),
+    ExpPoints    = round(2.78 * ExpPointsPct * Matches, 1),
+    PointsDiff   = round(ExpPoints - Points, 1)
+  ) %>%
+  arrange(desc(PointsDiff))
+
+r2 <- cor(team_stats$Points, team_stats$ExpPoints)^2
+cat(sprintf("R-squared (actual vs. expected points): %.3f\n\n", r2))
+
+print(team_stats)
+
+# ---- 4. Plot: actual vs. expected points ----
+
+ 
+plt <- ggplot(team_stats, aes(x = ExpPoints, y = Points, label = Team)) +
+  geom_point(color = "steelblue", size = 2.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  geom_text_repel(size = 3, color = "gray30", max.overlaps = Inf) +
+  labs(
+    title = "NWSL: Actual vs. Expected Points",
+    x = "Expected Points (Pythagorean)",
+    y = "Actual Points"
+  ) +
+  theme_minimal(base_size = 13)
+ 
+print(plt)   # displays the plot in your session (e.g. RStudio's Plots pane)
+ggsave("actual_vs_expected_points.png", plt, width = 7, height = 7, dpi = 120)
+
+
+# ---- 5. Project final standings (optional — for an in-progress season) ----
+# Uses each team's current per-game GF/GA rate, scaled to total_games.
+# Each team's own Matches count is used, so uneven games played is
+# already handled correctly.
+project_standings <- function(team_stats, total_games, x_pyth) {
+  team_stats %>%
+    mutate(
+      GF_per_game    = GF / Matches,
+      GA_per_game    = GA / Matches,
+      Proj_GF        = GF_per_game * total_games,
+      Proj_GA        = GA_per_game * total_games,
+      Proj_PointsPct = Proj_GF^x_pyth / (Proj_GF^x_pyth + Proj_GA^x_pyth),
+      ProjPoints     = round(Proj_PointsPct * 3 * total_games, 1),
+      GamesRemaining = total_games - Matches
+    ) %>%
+    arrange(desc(ProjPoints)) %>%
+    select(Team, Matches, GamesRemaining, Points, ProjPoints)
+}
+
+
+# Example usage (uncomment to run):
+ project_standings(team_stats, total_games, x_pyth) %>% as_tibble() %>% print(n = Inf)
+ 
+ colnames(team_stats)
+ pythag_simple <- subset(team_stats, select = -c(GF, GA, GF.per.match, GA.per.match, X, ExpPointsPct))
+ pythag_simple <- rename(pythag_simple, Hudl_xPoints = Expected.Points, Hudl_Diff = xPoints.Points, Pythag_xPoints = ExpPoints,
+                         Pythag_Diff = PointsDiff)
+ 
+ kable(pythag_simple)
+
+
+```
+
